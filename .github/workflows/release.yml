@@ -1,0 +1,112 @@
+name: release
+
+# Build ready-to-install extension binaries for every supported Postgres
+# version and attach them to a GitHub release. Trigger by pushing a `v*` tag
+# (e.g. `v0.0.1`).
+#
+# All builds use pgrx-managed Postgres (`cargo pgrx init --pgN=download`
+# builds PG from source): one uniform process on every runner, independent
+# of distro package availability (PGDG doesn't ship PG19 for Ubuntu yet).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload artifacts
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with the `pgrx` dependency in Cargo.toml.
+  PGRX_VERSION: 0.19.3
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-pg${{ matrix.pg }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14]
+        pg: [14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Build deps for the PG source build (bison/flex/readline/zlib), ICU
+      # (required by PG16+), and libclang (pgrx's bindgen step).
+      - name: Install system dependencies
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              libclang-dev pkg-config \
+              bison flex libreadline-dev zlib1g-dev libicu-dev
+          else
+            brew install icu4c
+            # icu4c is keg-only; export its path ahead of anything the
+            # project's `.cargo/config.toml` sets (a step-level env var
+            # takes precedence over cargo's `[env]`).
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Install pgrx-managed Postgres ${{ matrix.pg }}
+        run: cargo pgrx init --pg${{ matrix.pg }}=download
+
+      - name: Package for PG${{ matrix.pg }}
+        run: |
+          PG_CONFIG="$(cargo pgrx info path "pg${{ matrix.pg }}" 2>/dev/null)/bin/pg_config"
+          cargo pgrx package \
+            --pg-config "$PG_CONFIG" \
+            --out-dir "dist/pg${{ matrix.pg }}" \
+            --no-default-features -F "pg${{ matrix.pg }}"
+
+      - name: Stage and tar
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) ARCH=amd64 ;;
+            aarch64) ARCH=arm64 ;;
+          esac
+          OS="$(tr '[:upper:]' '[:lower:]' <<<"$RUNNER_OS")" # linux / macos
+          STAGE="stage/pg${{ matrix.pg }}"
+          mkdir -p "$STAGE"
+          find "dist/pg${{ matrix.pg }}" -type f \
+            \( -name '*.so' -o -name '*.dylib' -o -name '*.control' -o -name '*.sql' \) \
+            -exec cp {} "$STAGE"/ \;
+          tar -C "$STAGE" -czf \
+            "pg_otel_exporter-${VERSION}-pg${{ matrix.pg }}-${OS}-${ARCH}.tar.gz" \
+            .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pg${{ matrix.pg }}-${{ runner.os }}-${{ runner.arch }}
+          path: pg_otel_exporter-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Create release and attach tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job doesn't check out the repo, so `gh` can't infer the
+          # repository from a git remote — point it at the repo explicitly.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "pg_otel_exporter ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.tar.gz
