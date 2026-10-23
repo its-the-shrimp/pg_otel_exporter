@@ -1,0 +1,10 @@
+[env]
+# icu4c is keg-only on Homebrew; make pkg-config find it for pgrx's
+# Postgres configure step. Harmless on Linux (PKG_CONFIG_PATH only adds
+# search paths, so system .pc lookups are unaffected); there is no
+# target-scoped `[env]` in cargo config.
+PKG_CONFIG_PATH = "/opt/homebrew/opt/icu4c@78/lib/pkgconfig"
+
+[target.'cfg(target_os="macos")']
+# Postgres symbols won't be available until runtime
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]

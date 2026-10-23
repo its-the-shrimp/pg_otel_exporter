@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Post-commit hook: tag the commit as `v<version>` when the Cargo project
+# version changed in this commit. Pushing that tag (`git push origin v<ver>`)
+# triggers the `release` workflow (.github/workflows/release.yml), which
+# builds binaries for every supported PG version and attaches them to a
+# GitHub release.
+#
+# Bypass: set PG_OTEL_SKIP_VERSION_TAG=1 (e.g. for history-fixup commits).
+#
+# This hook never blocks a commit (it runs after it); on error it only warns.
+
+set -u
+
+if [ "${PG_OTEL_SKIP_VERSION_TAG:-}" != "" ]; then
+    exit 0
+fi
+
+# A comparison needs a parent commit.
+if ! git rev-parse --verify --quiet HEAD~1 >/dev/null; then
+    exit 0
+fi
+
+version_from() {
+    # Extract the [package] version from a Cargo.toml blob.
+    git show "$1:Cargo.toml" 2>/dev/null \
+        | grep -m1 '^version = ' | cut -d '"' -f2
+}
+
+OLD_VERSION=$(version_from HEAD~1)
+NEW_VERSION=$(version_from HEAD)
+
+if [ -z "$NEW_VERSION" ]; then
+    echo "post-commit: warning: no version found in Cargo.toml; not tagging" >&2
+    exit 0
+fi
+
+if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+    exit 0
+fi
+
+TAG="v$NEW_VERSION"
+if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    echo "post-commit: tag $TAG already exists; not re-tagging" >&2
+    exit 0
+fi
+
+if git tag -a "$TAG" -m "pg_otel_exporter $NEW_VERSION"; then
+    echo "post-commit: version changed $OLD_VERSION -> $NEW_VERSION; created tag $TAG" >&2
+    echo "post-commit: push it to run the release build: git push origin $TAG" >&2
+else
+    echo "post-commit: warning: failed to create tag $TAG" >&2
+fi

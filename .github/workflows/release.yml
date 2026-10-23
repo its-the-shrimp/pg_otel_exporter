@@ -1,0 +1,139 @@
+name: release
+
+# Build ready-to-install extension binaries for every supported Postgres
+# version and attach them to a GitHub release. Trigger by pushing a `v*` tag
+# (e.g. `v0.0.1`).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload artifacts
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with the `pgrx` dependency in Cargo.toml.
+  PGRX_VERSION: 0.19.3
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}-pg${{ matrix.pg }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18, 19]
+        include:
+          - arch: amd64
+            runs-on: ubuntu-22.04
+          - arch: arm64
+            runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Distro Postgres from PGDG is the fastest way to get matching server
+      # headers for every major; libclang is needed by pgrx's bindgen step.
+      - name: Install Postgres ${{ matrix.pg }} dev headers (PGDG)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-server-dev-${{ matrix.pg }} \
+            libclang-dev pkg-config
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Package for PG${{ matrix.pg }}
+        run: |
+          cargo pgrx package \
+            --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            --out-dir dist/pg${{ matrix.pg }} \
+            --no-default-features -F pg${{ matrix.pg }}
+
+      - name: Stage and tar
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="stage/pg${{ matrix.pg }}"
+          mkdir -p "$STAGE"
+          find dist/pg${{ matrix.pg }} -type f \
+            \( -name '*.so' -o -name '*.control' -o -name '*.sql' \) \
+            -exec cp {} "$STAGE"/ \;
+          tar -C stage -czf \
+            "pg_otel_exporter-${VERSION}-pg${{ matrix.pg }}-linux-${{ matrix.arch }}.tar.gz" \
+            pg${{ matrix.pg }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg${{ matrix.pg }}-linux-${{ matrix.arch }}
+          path: pg_otel_exporter-*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macos-arm64-pg${{ matrix.pg }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # pgrx-managed Postgres: Homebrew's postgresql@ formulas churn with EOL
+      # majors, while source builds cover the whole pg14..pg19 range (icu comes
+      # from the project-local PKG_CONFIG_PATH in .cargo/config.toml).
+      - name: Install pgrx-managed Postgres ${{ matrix.pg }}
+        run: |
+          cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+          cargo pgrx init --pg${{ matrix.pg }}=""
+
+      - name: Package for PG${{ matrix.pg }}
+        run: |
+          cargo pgrx package \
+            --pg-config ~/.pgrx/${{ matrix.pg }}/pgrx-install/bin/pg_config \
+            --out-dir dist/pg${{ matrix.pg }} \
+            --no-default-features -F pg${{ matrix.pg }}
+
+      - name: Stage and tar
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="stage/pg${{ matrix.pg }}"
+          mkdir -p "$STAGE"
+          find dist/pg${{ matrix.pg }} -type f \
+            \( -name '*.dylib' -o -name '*.control' -o -name '*.sql' \) \
+            -exec cp {} "$STAGE"/ \;
+          tar -C stage -czf \
+            "pg_otel_exporter-${VERSION}-pg${{ matrix.pg }}-macos-arm64.tar.gz" \
+            pg${{ matrix.pg }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg${{ matrix.pg }}-macos-arm64
+          path: pg_otel_exporter-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [linux, macos]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Create release and attach tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "pg_otel_exporter ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.tar.gz
