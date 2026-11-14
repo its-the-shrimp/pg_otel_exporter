@@ -5,7 +5,7 @@
 //! `f64_counter`) of a `SdkMeterProvider`; a `ManualReader` collects the
 //! aggregated data, which is transformed to protobuf and queued for export.
 
-use crate::config::METRIC_EXPORT_INTERVAL;
+use crate::{config::{METRIC_EXPORT_INTERVAL, METRICS}, otel::{Event, active}};
 
 use {
     opentelemetry::{
@@ -408,7 +408,7 @@ pub extern "C-unwind" fn metrics_worker() {
                 }
             }
 
-            if !crate::otel::active() || !crate::config::METRICS.get() {
+            if !active() || !METRICS.get() {
                 continue;
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -429,7 +429,7 @@ pub extern "C-unwind" fn metrics_worker() {
             let mut rm = ResourceMetrics::default();
             if reader.collect(&mut rm).is_ok() {
                 let request: ExportMetricsServiceRequest = (&rm).into();
-                exporter::queue(crate::otel::Event::Metrics(request.resource_metrics));
+                exporter::queue(Event::Metrics(request.resource_metrics));
             }
         }
     }

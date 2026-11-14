@@ -9,46 +9,54 @@
 //! backend's main thread.
 
 use {
-    super::{Event, snapshot},
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, never},
-    opentelemetry::InstrumentationScope,
-    opentelemetry_proto::{
+    super::{Event, config}, crossbeam_channel::{Receiver, RecvTimeoutError, Sender}, opentelemetry::InstrumentationScope, opentelemetry_proto::{
         tonic::{
             logs::v1::{LogsData, ResourceLogs},
             metrics::v1::{MetricsData, ResourceMetrics},
             trace::v1::{ResourceSpans, TracesData},
         },
         transform::common::tonic::ResourceAttributesWithSchema,
-    },
-    opentelemetry_sdk::{
+    }, opentelemetry_sdk::{
         error::OTelSdkResult,
         logs::{LogProcessor, SdkLogRecord},
         trace::{SpanData, SpanExporter},
-    },
-    pgrx::prelude::pg_guard,
-    prost::Message,
-    std::{
-        future::Future,
-        sync::{Mutex, OnceLock, PoisonError},
-        thread::sleep,
-        time::{Duration, Instant},
+    }, pgrx::{pg_sys, prelude::pg_guard}, prost::Message, std::{
+        future::Future, mem::replace, panic::catch_unwind, sync::{Mutex, OnceLock, PoisonError}, thread::{Builder, JoinHandle, sleep}, time::{Duration, Instant},
     },
 };
 
 // ---- queue ------------------------------------------------------------------
 
-static THREAD: OnceLock<()> = OnceLock::new();
-static THREAD_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
-static SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
-static RECEIVER: OnceLock<Mutex<Receiver<Event>>> = OnceLock::new();
-static EXIT_HOOK: OnceLock<()> = OnceLock::new();
-
 /// Upper bound on queued events; when full, `queue` drops new events.
 /// Prevents unbounded memory growth when the collector is down or slow.
 const QUEUE_CAP: usize = 10_240;
 
+/// Sender, receiver, and thread handle for the exporter thread, guarded by
+/// one mutex: they are created together and only ever taken together (exit
+/// flush).
+struct Exporter {
+    sender: Option<Sender<Event>>,
+    receiver: Option<Receiver<Event>>,
+    handle: Option<JoinHandle<()>>,
+    /// Set first inside the lock so [`ensure_started_with`] runs at most once.
+    spawned: bool,
+    /// Whether the `on_proc_exit` hook has been registered.
+    exit_hook: bool,
+}
+
+static EXPORTER: Mutex<Exporter> = Mutex::new(Exporter {
+    sender: None,
+    receiver: None,
+    handle: None,
+    spawned: false,
+    exit_hook: false,
+});
+
 /// Shared HTTP agent — keeps connections alive between export requests
 /// instead of paying full connection setup for every single POST.
+///
+/// Deliberately separate from [`EXPORTER`]: `http_post` must never hold the
+/// shared exporter lock across network I/O.
 static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 /// POST `body` to `{endpoint}{path}` over the shared [`HTTP_AGENT`].
@@ -78,23 +86,25 @@ fn http_post(endpoint: &str, path: &str, body: &[u8]) -> Result<(), String> {
 /// Must NOT be called from the postmaster (during `shared_preload_libraries`
 /// `_PG_init`) because threads do not survive `fork()` into backends — hence
 /// this is called lazily from [`queue`] on first use in each backend/worker.
-fn ensure_started() {
-    THREAD.get_or_init(|| {
-        let (tx, rx) = crossbeam_channel::bounded(QUEUE_CAP);
-        if let Ok(mut guard) = SENDER.lock() {
-            *guard = Some(tx);
+fn ensure_started_with(exporter: &mut Exporter) {
+    if replace(&mut exporter.spawned, true) {
+        return;
+    }
+    if !replace(&mut exporter.exit_hook, true) {
+        unsafe {
+            pg_sys::on_proc_exit(Some(exit_flush), pg_sys::Datum::from(0usize));
         }
-        let _ = RECEIVER.set(Mutex::new(rx));
-        let spawned = std::thread::Builder::new()
-            .name("pg_otel_exporter".into())
-            .spawn(run);
-        if let Ok(mut guard) = THREAD_HANDLE.lock() {
-            *guard = spawned.ok();
-        }
-    });
-    EXIT_HOOK.get_or_init(|| unsafe {
-        pgrx::pg_sys::on_proc_exit(Some(exit_flush), pgrx::pg_sys::Datum::from(0usize));
-    });
+    }
+    let (tx, rx) = crossbeam_channel::bounded(QUEUE_CAP);
+    exporter.receiver = Some(rx);
+    exporter.sender = Some(tx);
+    // Spawned while the lock is still held: `run` blocks on this mutex until
+    // the struct above is fully initialized, then clones its receiver and
+    // releases it.
+    exporter.handle = Builder::new()
+        .name("pg_otel_exporter".into())
+        .spawn(run)
+        .ok();
 }
 
 /// Queue an event; never blocks, never panics into the backend.
@@ -106,11 +116,15 @@ pub fn queue(event: Event) {
     if !super::active() {
         return;
     }
-    ensure_started();
-    let Ok(guard) = SENDER.lock() else {
-        return;
+    // Clone the sender under the lock, then release it: `try_send` needs only
+    // the sender half, and the lock must never be held across channel ops the
+    // exporter thread might block on.
+    let tx = {
+        let mut guard = EXPORTER.lock().unwrap_or_else(PoisonError::into_inner);
+        ensure_started_with(&mut guard);
+        guard.sender.clone()
     };
-    let Some(tx) = guard.as_ref() else {
+    let Some(tx) = tx else {
         return;
     };
     if tx.try_send(event).is_err() {
@@ -120,71 +134,67 @@ pub fn queue(event: Event) {
 
 // ---- exit-time synchronous flush ---------------------------------------------
 
-/// Drain everything currently queued and POST it synchronously. Used by the
-/// on-proc-exit last-chance flush.
-fn flush_sync() {
-    let Some(rx) = RECEIVER.get() else { return };
-    let mut spans: Vec<ResourceSpans> = Vec::new();
-    let mut logs: Vec<ResourceLogs> = Vec::new();
-    let mut metrics: Vec<ResourceMetrics> = Vec::new();
-    {
-        let rx = rx.lock().unwrap_or_else(PoisonError::into_inner);
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                Event::Spans(mut v) => spans.append(&mut v),
-                Event::Logs(mut v) => logs.append(&mut v),
-                Event::Metrics(mut v) => metrics.append(&mut v),
-            }
-        }
-    }
-    post_all(&mut spans, &mut logs, &mut metrics);
-}
-
 #[pg_guard]
-unsafe extern "C-unwind" fn exit_flush(_code: i32, _arg: pgrx::pg_sys::Datum) {
+unsafe extern "C-unwind" fn exit_flush(_code: i32, _arg: pg_sys::Datum) {
     // Short-lived backends may exit before the periodic flush fires; push
     // their telemetry out synchronously before the process goes away.
-    let _ = std::panic::catch_unwind(|| {
-        let snap = match snapshot() {
-            Some(s) if s.export_enabled && s.endpoint.is_some() => s,
-            _ => return,
-        };
-        let _ = snap;
-        // 1. stop the exporter thread cleanly: dropping the sender makes its
-        //    recv() return Disconnected, at which point it flushes whatever it
-        //    had batched locally.
-        if let Ok(mut guard) = SENDER.lock() {
-            guard.take();
+    let _ = catch_unwind(|| {
+        if !config().is_some_and(|s| s.export_enabled && s.endpoint.is_some()) {
+            return;
         }
-        // 2. wait for it to finish that final flush.
-        if let Ok(mut guard) = THREAD_HANDLE.lock()
-            && let Some(handle) = guard.take()
-        {
+        // One pass under the lock: dropping the stored sender disconnects the
+        // channel (so `run` sees Disconnected, flushes its batch, and exits),
+        // and taking the receiver lets this thread drain the leftovers here.
+        let (handle, rx) = {
+            let mut guard = EXPORTER.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.sender.take(); // dropping the stored sender disconnects the channel
+            (guard.handle.take(), guard.receiver.take())
+        };
+        // Wait for the thread to finish that final flush.
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
-        // 3. drain anything still queued and flush it here.
-        flush_sync();
+        // The thread is gone now, so draining is uncontended.
+        let mut spans: Vec<ResourceSpans> = Vec::new();
+        let mut logs: Vec<ResourceLogs> = Vec::new();
+        let mut metrics: Vec<ResourceMetrics> = Vec::new();
+        if let Some(rx) = rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::Spans(mut v) => spans.append(&mut v),
+                    Event::Logs(mut v) => logs.append(&mut v),
+                    Event::Metrics(mut v) => metrics.append(&mut v),
+                }
+            }
+        }
+        post_all(&mut spans, &mut logs, &mut metrics);
     });
 }
 
 // ---- HTTP thread --------------------------------------------------------------
 
 fn run() {
-    // RECEIVER is populated in `ensure_started` before this thread is
-    // spawned, so it is always available here.
-    let rx = RECEIVER.get_or_init(|| Mutex::new(never()));
+    // Clone the receiver under the lock, then release it: the exporter thread
+    // must never hold the shared lock across blocking recv waits, or `queue`
+    // and the exit flush would stall on it.
+    let rx = EXPORTER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .receiver
+        .clone();
+    let Some(rx) = rx else {
+        return;
+    };
     let mut spans: Vec<ResourceSpans> = Vec::new();
     let mut logs: Vec<ResourceLogs> = Vec::new();
     let mut metrics: Vec<ResourceMetrics> = Vec::new();
 
     loop {
-        let snap = match snapshot() {
+        let snap = match config() {
             Some(s) if s.export_enabled && s.endpoint.is_some() => s,
             _ => {
                 // nothing configured (yet); drain and wait
-                let rx = rx.lock().unwrap_or_else(PoisonError::into_inner);
                 while rx.try_recv().is_ok() {}
-                drop(rx);
                 sleep(Duration::from_millis(1000));
                 continue;
             }
@@ -202,8 +212,7 @@ fn run() {
             } else {
                 deadline.saturating_duration_since(Instant::now())
             };
-            let guard = rx.lock().unwrap_or_else(PoisonError::into_inner);
-            match guard.recv_timeout(wait) {
+            match rx.recv_timeout(wait) {
                 Ok(event) => {
                     let n = match event {
                         Event::Spans(mut v) => {
@@ -227,7 +236,6 @@ fn run() {
                 Err(RecvTimeoutError::Timeout) => timed_out = true,
                 Err(RecvTimeoutError::Disconnected) => {
                     // sender dropped (process exiting): flush the local batch
-                    drop(guard);
                     post_all(&mut spans, &mut logs, &mut metrics);
                     return;
                 }
@@ -248,7 +256,7 @@ fn post_all(
     if spans.is_empty() && logs.is_empty() && metrics.is_empty() {
         return;
     }
-    let snap = match snapshot() {
+    let snap = match config() {
         Some(s) if s.export_enabled && s.endpoint.is_some() => s,
         _ => {
             spans.clear();

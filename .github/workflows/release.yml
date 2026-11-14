@@ -20,6 +20,33 @@ env:
   PGRX_VERSION: 0.19.3
 
 jobs:
+  # The crate has no default Postgres version feature; building without
+  # picking one must fail at compile time (pgrx's build script rejects it,
+  # and a `compile_error!` in src/lib.rs backs that up). Guard against a
+  # future accidental default.
+  guard-no-default-pg:
+    name: no-default-pg-build-fails
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Building without a pg version feature must fail
+        run: |
+          if cargo check --quiet --no-default-features 2>err.log; then
+            echo "::error::build without a pgN feature unexpectedly succeeded"
+            cat err.log
+            exit 1
+          fi
+          if ! grep -qF 'pg$VERSION' err.log \
+            && ! grep -qF 'no Postgres version selected' err.log
+          then
+            echo "::error::feature-less build failed, but not for the expected reason"
+            cat err.log
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.os }}-pg${{ matrix.pg }}
     runs-on: ${{ matrix.os }}
@@ -90,7 +117,7 @@ jobs:
 
   release:
     name: release
-    needs: [build]
+    needs: [guard-no-default-pg, build]
     runs-on: ubuntu-22.04
     steps:
       - name: Download all artifacts

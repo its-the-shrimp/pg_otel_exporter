@@ -55,7 +55,7 @@ pub fn log_level() -> Option<i32> {
 /// Postgres GUCs may only be touched from the backend's main thread; the
 /// exporter thread works exclusively off copies of this.
 #[derive(Debug, Clone)]
-pub struct Snapshot {
+pub struct Config {
     pub export_enabled: bool,
     pub endpoint: Option<String>,
     pub service_name: String,
@@ -64,8 +64,8 @@ pub struct Snapshot {
 }
 
 /// Must only be called from the backend main thread.
-pub fn take_snapshot() -> Snapshot {
-    Snapshot {
+pub fn get_config() -> Config {
+    Config {
         export_enabled: !SDK_DISABLED.get(),
         endpoint: endpoint(),
         service_name: service_name(),
@@ -81,7 +81,7 @@ pub fn take_snapshot() -> Snapshot {
     }
 }
 
-pub fn endpoint() -> Option<String> {
+fn endpoint() -> Option<String> {
     ENDPOINT
         .get()
         .as_ref()
@@ -89,7 +89,7 @@ pub fn endpoint() -> Option<String> {
         .map(|s| s.trim_end_matches('/').to_string())
 }
 
-pub fn service_name() -> String {
+fn service_name() -> String {
     SERVICE_NAME
         .get()
         .as_ref()

@@ -10,18 +10,14 @@
 pub mod exporter;
 
 use {
-    opentelemetry::{KeyValue, logs::LoggerProvider as _, trace::TracerProvider as _},
-    opentelemetry_proto::tonic::{
+    crate::config::{Config, get_config}, opentelemetry::{KeyValue, logs::LoggerProvider as _, trace::TracerProvider as _}, opentelemetry_proto::tonic::{
         logs::v1::ResourceLogs, metrics::v1::ResourceMetrics, trace::v1::ResourceSpans,
-    },
-    opentelemetry_sdk::{
+    }, opentelemetry_sdk::{
         Resource,
         logs::SdkLoggerProvider,
         trace::{SdkTracerProvider, Tracer},
-    },
-    std::{
-        sync::{Mutex, OnceLock},
-        time::Duration,
+    }, std::{
+        sync::{Mutex, OnceLock, PoisonError}, time::{Duration, Instant},
     },
 };
 
@@ -34,52 +30,61 @@ pub enum Event {
     Metrics(Vec<ResourceMetrics>),
 }
 
-static RESOURCE: OnceLock<Resource> = OnceLock::new();
-static TRACER: OnceLock<Tracer> = OnceLock::new();
-static LOGGER: OnceLock<SdkLoggerProvider> = OnceLock::new();
+/// The telemetry pipeline for this process, built exactly once on the backend
+/// main thread.
+struct Providers {
+    resource: Resource,
+    tracer: Tracer,
+    logger_provider: SdkLoggerProvider,
+}
+
+static PROVIDERS: OnceLock<Providers> = OnceLock::new();
 
 // ---- config snapshot --------------------------------------------------------
 
-struct SnapshotState {
-    snapshot: Option<crate::config::Snapshot>,
-    at: Option<std::time::Instant>,
+struct ConfigState {
+    config: Option<Config>,
+    at: Option<Instant>,
 }
 
-static SNAPSHOT_STATE: Mutex<SnapshotState> = Mutex::new(SnapshotState {
-    snapshot: None,
+static CONFIG_STATE: Mutex<ConfigState> = Mutex::new(ConfigState {
+    config: None,
     at: None,
 });
 
 /// True when exporting is on at all. Main thread only: refreshes the config
-/// snapshot (reading GUCs) from the backend main thread when it goes stale.
+/// snapshot (reading GUCs) from the calling process' main thread (backend or
+/// metrics worker) when it goes stale.
 pub fn active() -> bool {
-    let mut state = SNAPSHOT_STATE
+    let mut state = CONFIG_STATE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(PoisonError::into_inner);
     if state
         .at
         .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
     {
-        state.snapshot = Some(crate::config::take_snapshot());
-        state.at = Some(std::time::Instant::now());
+        state.config = Some(get_config());
+        state.at = Some(Instant::now());
     }
     state
-        .snapshot
+        .config
         .as_ref()
         .is_some_and(|s| s.export_enabled && s.endpoint.is_some())
 }
 
 /// Latest config snapshot; safe from any thread.
 ///
-/// Non-main threads (the exporter thread) must not read GUCs, so they read the
-/// last snapshot published here. The main thread refreshes it on every
-/// statement (`trace_enabled_here` → [`active`]), so staleness is bounded by
-/// statement activity — an idle backend exports nothing anyway.
-pub fn snapshot() -> Option<crate::config::Snapshot> {
-    SNAPSHOT_STATE
+/// Non-main threads (the exporter thread) must not read GUCs, so they act on
+/// the last snapshot published here. The main threads refresh it via
+/// [`active`] — the backend on every statement (`trace_enabled_here`), the
+/// metrics worker on every collect interval — so a config change becomes
+/// visible to the exporter thread at the next statement or collect interval,
+/// plus one exporter poll.
+pub fn config() -> Option<Config> {
+    CONFIG_STATE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .snapshot
+        .unwrap_or_else(PoisonError::into_inner)
+        .config
         .clone()
 }
 
@@ -107,13 +112,10 @@ fn hostname() -> String {
 /// Main thread only (reads GUCs + database name).
 pub fn resource() -> &'static Resource {
     ensure_init();
-    RESOURCE.get().expect("pg_otel_exporter not initialized")
+    &PROVIDERS.get().expect("pg_otel_exporter not initialized").resource
 }
 
 // ---- providers ----------------------------------------------------------------
-
-/// Runs [`ensure_init`] exactly once per process.
-static INIT: std::sync::Once = std::sync::Once::new();
 
 /// Initialize the telemetry pipeline for THIS process. Main thread only.
 ///
@@ -121,12 +123,12 @@ static INIT: std::sync::Once = std::sync::Once::new();
 /// `_PG_init` (threads/providers don't survive `fork()`); backends call it
 /// lazily from the executor/log hooks, the metrics worker from its main loop.
 ///
-/// Safe to call on every hook invocation: [`std::sync::Once`] guarantees that
-/// the providers are built exactly once even if two threads race into here,
-/// so no thread can build a provider that then gets thrown away.
+/// Safe to call on every hook invocation: `get_or_init` guarantees that the
+/// providers are built exactly once even if two threads race into here, so no
+/// thread can build a pipeline that then gets thrown away.
 pub fn ensure_init() {
-    INIT.call_once(|| {
-        let snap = crate::config::take_snapshot();
+    PROVIDERS.get_or_init(|| {
+        let snap = get_config();
         let hostname = hostname();
         let resource = Resource::builder()
             .with_attributes([
@@ -150,6 +152,8 @@ pub fn ensure_init() {
             .with_resource(resource.clone())
             .with_simple_exporter(exporter::QueueSpanExporter)
             .build();
+        // The tracer keeps the provider's internals alive via internal `Arc`s,
+        // so the provider handle itself can go out of scope here.
         let tracer = tracer_provider.tracer("pg_otel_exporter");
 
         let logger_provider = SdkLoggerProvider::builder()
@@ -157,10 +161,11 @@ pub fn ensure_init() {
             .with_log_processor(exporter::QueueLogProcessor)
             .build();
 
-        let _ = RESOURCE.set(resource);
-        let _ = TRACER.set(tracer);
-        // keep the providers alive for the lifetime of the process
-        let _ = LOGGER.set(logger_provider);
+        Providers {
+            resource,
+            tracer,
+            logger_provider,
+        }
     });
 }
 
@@ -187,15 +192,16 @@ fn db_name() -> String {
 /// The process' tracer (spans). Initializes the pipeline on first use.
 pub fn tracer() -> &'static Tracer {
     ensure_init();
-    TRACER.get().expect("pg_otel_exporter not initialized")
+    &PROVIDERS.get().expect("pg_otel_exporter not initialized").tracer
 }
 
 /// A logger from the process' [`SdkLoggerProvider`]. Initializes the pipeline
 /// on first use.
 pub fn logger() -> opentelemetry_sdk::logs::SdkLogger {
     ensure_init();
-    LOGGER
+    PROVIDERS
         .get()
         .expect("pg_otel_exporter not initialized")
+        .logger_provider
         .logger("pg_otel_exporter")
 }

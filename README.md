@@ -64,11 +64,13 @@ cp pg_otel_exporter.control pg_otel_exporter--<version>.sql "$(pg_config --share
 
 ### From source
 
-Build with [pgrx] and install into a pgrx-managed Postgres:
+Build with [pgrx] and install into a pgrx-managed Postgres. The crate has no
+default Postgres version: pick one explicitly (`pg14`–`pg19`); a build without
+a version feature fails at compile time.
 
 ```sh
 cargo pgrx init            # once, per Postgres version
-cargo pgrx install --release
+cargo pgrx install --release --no-default-features -F pg17
 ```
 
 ## Setup
@@ -148,8 +150,8 @@ executed when the message was raised, plus `db.*` attributes.
 ## Development
 
 ```sh
-cargo test                       # unit tests (traceparent parsing)
-cargo pgrx test pg17             # integration tests against a managed PG
+cargo test --no-default-features -F pg17   # unit tests (traceparent parsing)
+cargo pgrx test pg17                       # integration tests against a managed PG
 ```
 
 A stub OTLP receiver (prints whatever arrives on :4319) lives in `tools/otel_receiver.py`

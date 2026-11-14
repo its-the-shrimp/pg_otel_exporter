@@ -19,6 +19,21 @@
 #![allow(static_mut_refs)]
 #![allow(clippy::doc_markdown)]
 
+// No default Postgres version: every build must select one explicitly. In
+// practice pgrx's build script rejects a feature-less build before we compile,
+// but this keeps the contract enforced and discoverable in the crate itself.
+#[cfg(not(any(
+    feature = "pg14",
+    feature = "pg15",
+    feature = "pg16",
+    feature = "pg17",
+    feature = "pg18",
+    feature = "pg19",
+)))]
+compile_error!(
+    "no Postgres version selected: build with --no-default-features --features pg14..pg19"
+);
+
 use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);

@@ -541,8 +541,6 @@ pub unsafe fn install() {
     pg_sys::ProcessUtility_hook = Some(process_utility_hook);
 
     // Unwind the query stack when a (sub)transaction aborts.
-    if std::env::var("PG_OTEL_NO_XACT_CB").is_err() {
-        pg_sys::RegisterXactCallback(Some(xact_callback), std::ptr::null_mut());
-        pg_sys::RegisterSubXactCallback(Some(subxact_callback), std::ptr::null_mut());
-    }
+    pg_sys::RegisterXactCallback(Some(xact_callback), std::ptr::null_mut());
+    pg_sys::RegisterSubXactCallback(Some(subxact_callback), std::ptr::null_mut());
 }
