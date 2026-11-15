@@ -27,7 +27,7 @@ fn hex_decode(hex: &str, out: &mut [u8]) -> Option<()> {
     Some(())
 }
 
-fn parse_traceparent(s: &str) -> Option<TraceCtx> {
+pub fn parse_traceparent(s: &str) -> Option<TraceCtx> {
     let s = s.trim();
     let mut parts = s.splitn(4, '-');
     let version = parts.next()?;

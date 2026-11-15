@@ -5,7 +5,10 @@
 //! `f64_counter`) of a `SdkMeterProvider`; a `ManualReader` collects the
 //! aggregated data, which is transformed to protobuf and queued for export.
 
-use crate::{config::{METRIC_EXPORT_INTERVAL, METRICS}, otel::{Event, active}};
+use crate::{
+    config::{METRIC_EXPORT_INTERVAL, METRICS},
+    otel::{Event, active},
+};
 
 use {
     opentelemetry::{

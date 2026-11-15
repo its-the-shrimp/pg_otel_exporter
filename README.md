@@ -8,15 +8,10 @@ metrics**, configurable directly in `postgresql.conf`.
   (functions, SPI, CTEs with subqueries) become child spans of the outer
   statement.
 - **Trace-context propagation** — apps can attach a query to a distributed
-  trace by embedding a W3C `traceparent` in a sqlcommenter-style SQL comment:
-
-  ```sql
-  SELECT * FROM users /* traceparent='00-<trace-id>-<parent-span-id>-01' */;
-  ```
-
-  The span for that query then shares the caller's trace id and parents to the
-  caller's span id, so it shows up nested under the application's request in
-  Jaeger, OpenObserve, etc.
+  trace by passing a W3C `traceparent` through either of two sources:
+  a sqlcommenter-style SQL comment, or a `traceparent` procedure call inside
+  the request's transaction (see
+  [Trace-context propagation](#trace-context-propagation)).
 - **Metrics** — a background worker samples `pg_stat_*` views on an interval
   and exports the metric set of otelcol-contrib's Postgres receiver
   (`postgresql.commits`, `postgresql.connections`, `postgresql.database_size`,
@@ -87,7 +82,7 @@ Then in each database: `CREATE EXTENSION pg_otel_exporter;`
 ## Configuration
 
 All configuration lives in `postgresql.conf` (GUCs are `USERSET`, so they can
-also be changed per-database, per-role or per-session and reload with
+also be changed per-database, per-role or per-session and be reloaded with
 `pg_reload_conf()`).
 
 ### Standard OpenTelemetry values
@@ -129,7 +124,8 @@ These are equivalent to the standard OpenTelemetry environment variables, minus 
 | `db.rows_affected` | rows processed |
 
 Utility statements (DDL, `COPY`, `DO`, ...) are captured via the
-`ProcessUtility` hook. Errors mark the span's status.
+`ProcessUtility` hook. Transaction-control statements (`BEGIN`, `COMMIT`,
+`SAVEPOINT`, ...) create no spans. Errors mark the span's status.
 
 ### Metrics
 
@@ -147,11 +143,51 @@ Log records carry severity (mapped to OTel severity numbers), message,
 `code.function`, `code.filepath`, and the trace/span ids of the query being
 executed when the message was raised, plus `db.*` attributes.
 
+## Trace-context propagation
+
+A query can join the caller's distributed trace: its span shares the caller's
+trace id and parents to the caller's span id, so it shows up nested under the
+application's request in Jaeger, OpenObserve, etc.
+
+Two sources mentioned below can attach a W3C `traceparent` to statements.
+When both are provided for the same statement, the comment wins and a warning is logged.
+
+### Procedure
+
+A procedure call inside a transaction: `CALL traceparent('00-<trace-id>-<parent-span-id>-<flags>')`.
+Calling it outside of a transaction is a no-op and simply logs a warning.
+
+```sql
+BEGIN;
+CALL traceparent('00-0af7651916cd43dd8448eb8c8defd531-00f067aa0ba902b7-01');
+SELECT * FROM users;
+COMMIT;
+```
+
+The provided ID is applied to all statements inside the transaction after the call, and
+the value is cleared at the end of it (commit, abort, or
+`PREPARE TRANSACTION`). Providing an invalid `traceparent` is a no-op and an error will be logged.
+
+### Comment
+
+sqlcommenter-style `key=value` comment:
+
+```sql
+SELECT * FROM users /* traceparent='00-0af7651916cd43dd8448eb8c8defd531-00f067aa0ba902b7-01' */;
+```
+
 ## Development
 
 ```sh
-cargo test --no-default-features -F pg17   # unit tests (traceparent parsing)
-cargo pgrx test pg17                       # integration tests against a managed PG
+cargo test --no-default-features -F pg17   # repo invariants + unit tests + pg_tests (managed PG)
+cargo pgrx test pg17                       # same, via cargo pgrx
 ```
+
+Hook up the hooks to your git config using `git config core.hooksPath .githooks`:
+the pre-commit hook runs the whole suite for pg14–pg19 before every commit
+(requires a pgrx-managed Postgres per version; bypass with
+`git commit --no-verify`), and the post-commit hook
+tags a commit `v<version>` when the Cargo version changed (pushing that tag
+runs the release workflow).
 
 A stub OTLP receiver (prints whatever arrives on :4319) lives in `tools/otel_receiver.py`

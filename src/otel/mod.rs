@@ -10,14 +10,19 @@
 pub mod exporter;
 
 use {
-    crate::config::{Config, get_config}, opentelemetry::{KeyValue, logs::LoggerProvider as _, trace::TracerProvider as _}, opentelemetry_proto::tonic::{
+    crate::config::{Config, get_config},
+    opentelemetry::{KeyValue, logs::LoggerProvider as _, trace::TracerProvider as _},
+    opentelemetry_proto::tonic::{
         logs::v1::ResourceLogs, metrics::v1::ResourceMetrics, trace::v1::ResourceSpans,
-    }, opentelemetry_sdk::{
+    },
+    opentelemetry_sdk::{
         Resource,
         logs::SdkLoggerProvider,
         trace::{SdkTracerProvider, Tracer},
-    }, std::{
-        sync::{Mutex, OnceLock, PoisonError}, time::{Duration, Instant},
+    },
+    std::{
+        sync::{Mutex, OnceLock, PoisonError},
+        time::{Duration, Instant},
     },
 };
 
@@ -56,9 +61,7 @@ static CONFIG_STATE: Mutex<ConfigState> = Mutex::new(ConfigState {
 /// snapshot (reading GUCs) from the calling process' main thread (backend or
 /// metrics worker) when it goes stale.
 pub fn active() -> bool {
-    let mut state = CONFIG_STATE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut state = CONFIG_STATE.lock().unwrap_or_else(PoisonError::into_inner);
     if state
         .at
         .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
@@ -112,7 +115,10 @@ fn hostname() -> String {
 /// Main thread only (reads GUCs + database name).
 pub fn resource() -> &'static Resource {
     ensure_init();
-    &PROVIDERS.get().expect("pg_otel_exporter not initialized").resource
+    &PROVIDERS
+        .get()
+        .expect("pg_otel_exporter not initialized")
+        .resource
 }
 
 // ---- providers ----------------------------------------------------------------
@@ -192,7 +198,10 @@ fn db_name() -> String {
 /// The process' tracer (spans). Initializes the pipeline on first use.
 pub fn tracer() -> &'static Tracer {
     ensure_init();
-    &PROVIDERS.get().expect("pg_otel_exporter not initialized").tracer
+    &PROVIDERS
+        .get()
+        .expect("pg_otel_exporter not initialized")
+        .tracer
 }
 
 /// A logger from the process' [`SdkLoggerProvider`]. Initializes the pipeline

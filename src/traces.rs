@@ -1,19 +1,33 @@
 //! Query-span capture: ExecutorStart/End hooks + `ProcessUtility` hook, with
-//! W3C trace-context extracted from sqlcommenter-style SQL comments (see
-//! [`crate::sql`]).
+//! W3C trace-context from two channels: a sqlcommenter-style SQL
+//! comment (see [`crate::sql`]) or the `traceparent` procedure, which latches
+//! a value for the rest of its transaction.
 //!
 //! Spans are created through the `opentelemetry` tracer API and finished via
 //! `Span::end_with_timestamp`, at which point the SDK's processor hands them
 //! to our export queue.
 
 use {
-    crate::{config::TRACES, otel::{self, tracer}, sql::traceparent_from_statement}, opentelemetry::{
+    crate::{
+        config::TRACES,
+        otel::{self, tracer},
+        sql::{TraceCtx, parse_traceparent, traceparent_from_statement},
+    },
+    opentelemetry::{
         Context, KeyValue,
         trace::{
             Span, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState,
             Tracer as _,
         },
-    }, opentelemetry_sdk::trace::Span as SdkSpan, pgrx::prelude::*, std::{borrow::Cow, cell::RefCell, ffi::{CStr, c_char}, time::SystemTime},
+    },
+    opentelemetry_sdk::trace::Span as SdkSpan,
+    pgrx::{pg_getarg, pg_return_void, prelude::*},
+    std::{
+        borrow::Cow,
+        cell::RefCell,
+        ffi::{CStr, c_char},
+        time::SystemTime,
+    },
 };
 
 /// Identifies the statement an [`Active`] entry belongs to.
@@ -48,6 +62,20 @@ thread_local! {
     /// otherwise stay on the stack forever — and every later statement would
     /// be nested under a dead span.
     static SUBXACT_BASES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+
+    /// Traceparent latched by the `traceparent` procedure for the current
+    /// transaction. Per-backend state: a backend is a single-threaded
+    /// process, so no mutex; the value never outlives its transaction
+    /// (cleared by [`xact_callback`]).
+    static LATCHED: RefCell<Option<TraceCtx>> = const { RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+thread_local! {
+    /// Fresh trace context the most recent [`push_span`] resolved — `None`
+    /// for nested statements, which never resolve. Test-only observability:
+    /// the stack depth alone can't assert lineage.
+    static LAST_RESOLVED: RefCell<Option<TraceCtx>> = const { RefCell::new(None) };
 }
 
 /// The innermost active statement's span context, if any (for log records).
@@ -162,6 +190,12 @@ fn trace_enabled_here() -> bool {
     true
 }
 
+/// Postgres's `IsParallelWorker()` macro: `ParallelWorkerNumber >= 0`.
+/// pgrx binds the variable, not the macro.
+fn is_parallel_worker() -> bool {
+    unsafe { pg_sys::ParallelWorkerNumber >= 0 }
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -215,26 +249,31 @@ fn statement_attributes(statement: &str) -> impl Iterator<Item = KeyValue> {
     }
 }
 
-/// Begin tracking a statement: resolve the parent context (from a comment or
-/// the innermost enclosing statement), start the SDK span, push the stack.
+/// Begin tracking a statement: resolve the parent context (comment, latched
+/// `traceparent`, or the innermost enclosing statement), start the SDK span,
+/// push the stack.
 ///
 /// `origin` identifies the statement, so that the matching end hook pops
 /// *this* entry and not an unrelated one.
 fn push_span(statement: &str, tag: &'static str, origin: Origin) {
     let depth = QUERY_STACK.with(|s| s.borrow().len());
 
-    // Resolve trace context: explicit (comment) for top-level, otherwise
-    // parent = enclosing statement's span.
-    let explicit = if depth == 0 {
-        traceparent_from_statement(statement)
+    // Fresh trace context only for top-level statements of the leader
+    // process: comment, then the value latched by the `traceparent`
+    // procedure. Nested statements (triggers, SPI) and parallel workers
+    // always parent to the enclosing span / the leader and never resolve.
+    let fresh = if depth == 0 && !is_parallel_worker() {
+        resolve_fresh(statement)
     } else {
         None
     };
+    #[cfg(any(test, feature = "pg_test"))]
+    LAST_RESOLVED.with(|c| *c.borrow_mut() = fresh);
 
-    let sampled = explicit.is_some() || depth > 0 || roll_sample();
+    let sampled = fresh.is_some() || depth > 0 || roll_sample();
     let active = if sampled {
         let tracer = tracer();
-        let parent_cx = match explicit {
+        let parent_cx = match fresh {
             Some(ctx) => {
                 // join the propagated trace: caller's span as (remote) parent
                 let sc = SpanContext::new(
@@ -414,6 +453,21 @@ unsafe fn call_prev_process_utility(
     }
 }
 
+/// True when the utility statement is transaction control (`BEGIN`,
+/// `COMMIT`, `SAVEPOINT`, ...).
+///
+/// Decided from the parse node, not the string: in a multi-statement message
+/// every hook call receives the full text, so a leading-keyword check would
+/// skip the whole batch.
+unsafe fn is_tx_control_utility(pstmt: *mut pg_sys::PlannedStmt) -> bool {
+    is_tx_control_node(unsafe { (*pstmt).utilityStmt })
+}
+
+/// True when the parse node is a transaction-control statement.
+pub fn is_tx_control_node(utility: *mut pg_sys::Node) -> bool {
+    !utility.is_null() && unsafe { (*utility).type_ } == pg_sys::NodeTag::T_TransactionStmt
+}
+
 #[pg_guard]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C-unwind" fn process_utility_hook(
@@ -429,7 +483,10 @@ unsafe extern "C-unwind" fn process_utility_hook(
     // Only top-level utility statements; nested ones are covered via the
     // executor or are internal bookkeeping.
     let depth = QUERY_STACK.with(|s| s.borrow().len());
-    let capture = depth == 0 && trace_enabled_here() && !query_string.is_null();
+    let capture = depth == 0
+        && trace_enabled_here()
+        && !query_string.is_null()
+        && !unsafe { is_tx_control_utility(pstmt) };
     if capture {
         let statement = CStr::from_ptr(query_string).to_string_lossy().into_owned();
         push_span(&statement, "utility", Origin::Utility);
@@ -506,7 +563,9 @@ unsafe extern "C-unwind" fn subxact_callback(
     }
 }
 
-/// Transaction callback: unwinds the query stack when the transaction aborts.
+/// Transaction callback: unwinds the query stack when the transaction aborts,
+/// and drops the latched traceparent when the transaction ends — the latch
+/// must never outlive its transaction, so pool handbacks are always clean.
 unsafe extern "C-unwind" fn xact_callback(
     event: pg_sys::XactEvent::Type,
     _arg: *mut std::ffi::c_void,
@@ -519,6 +578,16 @@ unsafe extern "C-unwind" fn xact_callback(
             // unwound, including the ones that failed.
             SUBXACT_BASES.with(|b| b.borrow_mut().clear());
             unwind_stack_to(0);
+            LATCHED.with(|l| l.borrow_mut().take());
+        }
+        XactEvent::XACT_EVENT_PRE_COMMIT | XactEvent::XACT_EVENT_PREPARE => {
+            // The transaction is about to end or be prepared (a prepared
+            // transaction also ends the session's involvement): drop the
+            // latched traceparent.
+            SUBXACT_BASES.with(|b| {
+                b.borrow_mut().clear();
+            });
+            LATCHED.with(|l| l.borrow_mut().take());
         }
         _ => {
             // On commit the statements all completed and popped their spans.
@@ -526,6 +595,114 @@ unsafe extern "C-unwind" fn xact_callback(
             SUBXACT_BASES.with(|b| b.borrow_mut().clear());
         }
     }
+}
+
+// ---- traceparent procedure ingestion ---------------------------------------
+
+// The `traceparent` procedure. Objects can't live in a schema named after
+// the extension (Postgres reserves the `pg_` prefix), so the procedure is
+// created unqualified and lands in the extension's installation schema;
+// call it with whatever qualification puts it on `search_path`.
+extension_sql!(
+    r"CREATE PROCEDURE traceparent(tp text)
+       LANGUAGE c AS 'MODULE_PATHNAME', 'set_traceparent';",
+    name = "traceparent_proc",
+);
+
+/// Entry logic of the `traceparent` procedure.
+///
+/// An invalid W3C traceparent is an `ERROR` (programming error, fail-closed
+/// at call time). Outside an explicit transaction the call emits a `WARNING`
+/// and is ignored: instrumentation must never break the workload, and a
+/// latched value must never spill into other transactions. Inside a
+/// transaction the value latches until transaction end (a later call
+/// overwrites; last call wins).
+pub fn ingest_traceparent(tp: &str, in_tx: bool) {
+    let ctx = parse_traceparent(tp).unwrap_or_else(|| {
+        ereport!(
+            PgLogLevel::ERROR,
+            PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            "invalid W3C traceparent"
+        );
+        unreachable!("ereport(ERROR) does not return")
+    });
+    if !in_tx {
+        ereport!(
+            PgLogLevel::WARNING,
+            PgSqlErrorCode::ERRCODE_WARNING,
+            "call is ignored outside a transaction"
+        );
+        return;
+    }
+    LATCHED.with(|l| *l.borrow_mut() = Some(ctx));
+}
+
+/// C entry of the `traceparent` procedure. pgrx has no procedure attribute,
+/// so the SQL above declares it and this raw handler extracts the argument.
+/// An invalid `traceparent` argument raises a Postgres `ERROR`.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn set_traceparent(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
+    let tp = unsafe { pg_getarg::<String>(fcinfo, 0) };
+    let in_tx = unsafe { pg_sys::IsTransactionBlock() };
+    ingest_traceparent(tp.as_deref().unwrap_or(""), in_tx);
+    pg_return_void()
+}
+
+/// The `PG_FUNCTION_INFO_V1` metadata Postgres looks up next to the symbol.
+#[unsafe(no_mangle)]
+#[doc(hidden)]
+pub const extern "C" fn pg_finfo_set_traceparent() -> &'static pg_sys::Pg_finfo_record {
+    const V1_API: pg_sys::Pg_finfo_record = pg_sys::Pg_finfo_record { api_version: 1 };
+    &V1_API
+}
+
+/// Fresh trace context for a top-level statement: the sqlcommenter comment,
+/// else the value latched by the `traceparent` procedure.
+///
+/// When both channels provide a traceparent the comment wins (with a
+/// warning); the latch is kept for the remaining statements of its
+/// transaction.
+fn resolve_fresh(statement: &str) -> Option<TraceCtx> {
+    let latched = LATCHED.with(|l| *l.borrow());
+    if let Some(ctx) = traceparent_from_statement(statement) {
+        if latched.is_some() {
+            ereport!(
+                PgLogLevel::WARNING,
+                PgSqlErrorCode::ERRCODE_WARNING,
+                "traceparent was provided both via the procedure & via the comment; using the one from the comment"
+            );
+        }
+        return Some(ctx);
+    }
+    latched
+}
+
+/// What a top-level statement would resolve as fresh trace context right
+/// now: the comment on `statement`, else the latched value.
+///
+/// Test-only: real resolution happens inside [`push_span`], whose depth-0
+/// path can't be exercised from a pgrx test — tests always run inside the
+/// executor, so their statements are nested.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn resolve_fresh_ctx(statement: &str) -> Option<TraceCtx> {
+    resolve_fresh(statement)
+}
+
+/// The fresh trace context the most recent statement resolved (`None` for
+/// nested statements, which never resolve). Test-only: the stack depth alone
+/// can't assert lineage.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn last_resolved_ctx() -> Option<TraceCtx> {
+    LAST_RESOLVED.with(|c| *c.borrow())
+}
+
+/// Test hook: run the transaction callback as Postgres would at a commit or
+/// abort boundary. Real boundaries are unreachable from a pgrx test, which
+/// always executes inside a transaction (SPI runs atomically).
+#[cfg(any(test, feature = "pg_test"))]
+pub fn run_xact_callback(event: pg_sys::XactEvent::Type) {
+    unsafe { xact_callback(event, std::ptr::null_mut()) };
 }
 
 // ---- init ------------------------------------------------------------------

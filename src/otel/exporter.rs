@@ -9,19 +9,31 @@
 //! backend's main thread.
 
 use {
-    super::{Event, config}, crossbeam_channel::{Receiver, RecvTimeoutError, Sender}, opentelemetry::InstrumentationScope, opentelemetry_proto::{
+    super::{Event, config},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
+    opentelemetry::InstrumentationScope,
+    opentelemetry_proto::{
         tonic::{
             logs::v1::{LogsData, ResourceLogs},
             metrics::v1::{MetricsData, ResourceMetrics},
             trace::v1::{ResourceSpans, TracesData},
         },
         transform::common::tonic::ResourceAttributesWithSchema,
-    }, opentelemetry_sdk::{
+    },
+    opentelemetry_sdk::{
         error::OTelSdkResult,
         logs::{LogProcessor, SdkLogRecord},
         trace::{SpanData, SpanExporter},
-    }, pgrx::{pg_sys, prelude::pg_guard}, prost::Message, std::{
-        future::Future, mem::replace, panic::catch_unwind, sync::{Mutex, OnceLock, PoisonError}, thread::{Builder, JoinHandle, sleep}, time::{Duration, Instant},
+    },
+    pgrx::{pg_sys, prelude::pg_guard},
+    prost::Message,
+    std::{
+        future::Future,
+        mem::replace,
+        panic::catch_unwind,
+        sync::{Mutex, OnceLock, PoisonError},
+        thread::{Builder, JoinHandle, sleep},
+        time::{Duration, Instant},
     },
 };
 

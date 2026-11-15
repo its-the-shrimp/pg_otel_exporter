@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run the whole test suite for every supported Postgres
+# version before a commit can land — the repo invariants (tests/repo.rs:
+# rustfmt-clean, no default PG version), the plain unit tests, and the
+# pg_tests against a pgrx-managed Postgres (one `cargo pgrx init --pgN=download`
+# per version, pg14..pg19, on the committing machine).
+#
+# This only tests the working tree, not the staged snapshot.
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+for pg in pg14 pg15 pg16 pg17 pg18 pg19; do
+    echo "pre-commit: running the test suite ($pg)..." >&2
+    if ! cargo test --no-default-features -F "$pg"; then
+        echo "pre-commit: test suite failed on $pg; commit aborted." >&2
+        echo "pre-commit: fix the failures, or bypass the hook with: git commit --no-verify" >&2
+        exit 1
+    fi
+done

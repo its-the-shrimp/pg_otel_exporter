@@ -29,7 +29,9 @@ Hold mutex guards for as little time as possible, and doing as little work as po
 ## Release flow
 
 `.githooks/` is the tracked hooks dir (enable per clone with
-`git config core.hooksPath .githooks`). The post-commit hook tags a commit
-`v<version>` when Cargo's version changed; pushing that tag runs the release
-workflow (`.github/workflows/release.yml`), which packages binaries for
-pg14..pg19 and attaches them to a GitHub release.
+`git config core.hooksPath .githooks`). The pre-commit hook runs the test
+suite for every supported PG version; bypass a failing hook with
+`git commit --no-verify`, not with custom env vars. The post-commit hook
+tags a commit `v<version>` when Cargo's version changed; pushing that tag
+runs the release workflow (`.github/workflows/release.yml`), which packages
+binaries for pg14..pg19 and attaches them to a GitHub release.
