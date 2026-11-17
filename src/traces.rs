@@ -3,6 +3,15 @@
 //! comment (see [`crate::sql`]) or the `traceparent` procedure, which latches
 //! a value for the rest of its transaction.
 //!
+//! Explicit transaction blocks (`BEGIN` … `COMMIT`) additionally get a
+//! `transaction` span wrapping their statements. It is created lazily by the
+//! block's first captured statement — which also consumes the fresh trace
+//! context (the comment, else the latched `traceparent`) — and sits at the
+//! bottom of the statement stack, so everything the transaction does nests
+//! under it. Its start time is backdated to the `BEGIN` that opened the
+//! block; it ends at pre-commit (or prepare), or with an error status when
+//! the transaction aborts.
+//!
 //! Spans are created through the `opentelemetry` tracer API and finished via
 //! `Span::end_with_timestamp`, at which point the SDK's processor hands them
 //! to our export queue.
@@ -16,8 +25,8 @@ use {
     opentelemetry::{
         Context, KeyValue,
         trace::{
-            Span, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState,
-            Tracer as _,
+            Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags, TraceId,
+            TraceState, Tracer as _,
         },
     },
     opentelemetry_sdk::trace::Span as SdkSpan,
@@ -26,6 +35,7 @@ use {
         borrow::Cow,
         cell::RefCell,
         ffi::{CStr, c_char},
+        sync::OnceLock,
         time::SystemTime,
     },
 };
@@ -37,6 +47,8 @@ enum Origin {
     Executor(*mut pg_sys::QueryDesc),
     /// A utility statement (no `QueryDesc`).
     Utility,
+    /// The transaction span wrapping an explicit transaction block.
+    Transaction,
 }
 
 /// An in-flight statement in this backend.
@@ -49,9 +61,21 @@ pub struct Active {
     origin: Origin,
 }
 
+/// Per-transaction state that precedes the transaction span's creation.
+#[derive(Clone, Copy)]
+struct PendingTxn {
+    /// When the transaction's `BEGIN` was processed (the transaction span is
+    /// backdated to it).
+    started_at: Option<SystemTime>,
+    /// Traceparent latched by the `traceparent` procedure for this
+    /// transaction; consumed when the transaction span is created.
+    latch: Option<TraceCtx>,
+}
+
 thread_local! {
     /// Stack of in-flight statements in this backend. Statements run from
-    /// within other statements (SPI, plpgsql) become child spans.
+    /// within other statements (SPI, plpgsql) become child spans. An
+    /// explicit transaction block's transaction span sits at the bottom.
     pub static QUERY_STACK: RefCell<Vec<Active>> = const { RefCell::new(Vec::new()) };
 
     /// Depth of `QUERY_STACK` at the start of each open subtransaction.
@@ -63,11 +87,14 @@ thread_local! {
     /// be nested under a dead span.
     static SUBXACT_BASES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 
-    /// Traceparent latched by the `traceparent` procedure for the current
-    /// transaction. Per-backend state: a backend is a single-threaded
-    /// process, so no mutex; the value never outlives its transaction
-    /// (cleared by [`xact_callback`]).
-    static LATCHED: RefCell<Option<TraceCtx>> = const { RefCell::new(None) };
+    /// Per-transaction state that exists before the transaction span does:
+    /// the transaction's start time and the traceparent latched by the
+    /// `traceparent` procedure. Per-backend state: a backend is a
+    /// single-threaded process, so no mutex; cleared by [`xact_callback`] at
+    /// every transaction end, so nothing ever outlives its transaction.
+    static PENDING: RefCell<PendingTxn> = const {
+        RefCell::new(PendingTxn { started_at: None, latch: None })
+    };
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -78,9 +105,34 @@ thread_local! {
     static LAST_RESOLVED: RefCell<Option<TraceCtx>> = const { RefCell::new(None) };
 }
 
-/// The innermost active statement's span context, if any (for log records).
+/// The innermost active entry's span context, if any (for child spans and
+/// log records): the innermost statement, else the transaction span of the
+/// enclosing explicit block.
 pub fn active_span_context() -> Option<SpanContext> {
     QUERY_STACK.with(|s| s.borrow().last().and_then(|a| a.sc.clone()))
+}
+
+/// True when a transaction span is in flight (the stack's bottom entry).
+fn txn_span_active() -> bool {
+    QUERY_STACK.with(|s| {
+        s.borrow()
+            .first()
+            .is_some_and(|a| a.origin == Origin::Transaction)
+    })
+}
+
+/// Number of statement entries on the stack: the transaction span at the
+/// bottom (when present) is not a statement.
+fn stmt_depth() -> usize {
+    QUERY_STACK.with(|s| {
+        let stack = s.borrow();
+        stack.len()
+            - usize::from(
+                stack
+                    .first()
+                    .is_some_and(|a| a.origin == Origin::Transaction),
+            )
+    })
 }
 
 /// Current depth of the in-flight statement stack.
@@ -109,6 +161,9 @@ fn unwind_stack_to(base: usize) {
                 break;
             };
             if let Some(mut span) = active.span.take() {
+                if active.origin == Origin::Transaction {
+                    span.set_status(Status::error("transaction aborted"));
+                }
                 span.end_with_timestamp(SystemTime::now());
             }
         }
@@ -215,13 +270,28 @@ unsafe fn cstr_or(p: *const c_char, default: &str) -> Cow<'_, str> {
     }
 }
 
-fn statement_attributes(statement: &str) -> impl Iterator<Item = KeyValue> {
+/// The W3C span context a parsed traceparent carries: the caller's span, as
+/// a remote parent.
+fn remote_ctx(ctx: &TraceCtx) -> SpanContext {
+    SpanContext::new(
+        TraceId::from_hex(&hex_encode(&ctx.trace_id)).unwrap_or(TraceId::INVALID),
+        SpanId::from_hex(&hex_encode(&ctx.parent_span_id)).unwrap_or(SpanId::INVALID),
+        TraceFlags::new(ctx.flags),
+        true,
+        TraceState::NONE,
+    )
+}
+
+/// Attributes shared by statement and transaction spans: the DB semantic
+/// conventions' identity keys.
+///
+/// Catalog lookups (`get_database_name`, `GetUserNameFromId`) are only safe
+/// inside a live transaction. Utility statements still run after a failed
+/// statement in an aborted transaction block (SET, SHOW, ROLLBACK), i.e. in
+/// `TRANS_DEFAULT`/`TRANS_ABORT` state where the syscache asserts — so gate
+/// them behind `IsTransactionState()`.
+fn common_attributes() -> [KeyValue; 4] {
     unsafe {
-        // Catalog lookups (`get_database_name`, `GetUserNameFromId`) are only
-        // safe inside a live transaction. Utility statements still run
-        // after a failed statement in an aborted transaction block (SET,
-        // SHOW, ROLLBACK), i.e. in `TRANS_DEFAULT`/`TRANS_ABORT` state where
-        // the syscache asserts — so gate them behind `IsTransactionState()`.
         let in_txn = pg_sys::IsTransactionState();
         let db = if pg_sys::MyDatabaseId == pg_sys::InvalidOid || !in_txn {
             "unknown".to_string()
@@ -241,16 +311,74 @@ fn statement_attributes(statement: &str) -> impl Iterator<Item = KeyValue> {
         [
             KeyValue::new("db.system", "postgresql"),
             KeyValue::new("db.name", db),
-            KeyValue::new("db.statement", statement.trim().to_string()),
             KeyValue::new("db.user", user),
             KeyValue::new("db.application_name", app),
         ]
-        .into_iter()
     }
 }
 
-/// Begin tracking a statement: resolve the parent context (comment, latched
-/// `traceparent`, or the innermost enclosing statement), start the SDK span,
+fn statement_attributes(statement: &str) -> impl Iterator<Item = KeyValue> {
+    common_attributes()
+        .into_iter()
+        .chain([KeyValue::new("db.statement", statement.trim().to_string())])
+}
+
+fn transaction_attributes() -> impl Iterator<Item = KeyValue> {
+    common_attributes().into_iter()
+}
+
+/// Create the transaction span of an explicit transaction block and push it
+/// as the stack bottom. Returns the fresh trace context it resolved.
+///
+/// Called from [`push_span`] before the block's first captured statement
+/// creates its own span (which then finds the stack holding only this
+/// entry). The transaction span consumes the fresh context — the statement's
+/// sqlcommenter comment, else the value latched by the `traceparent`
+/// procedure — and joins the caller's trace as one subtree; every statement
+/// of the block nests under it. Fresh context is resolved exactly once per
+/// transaction: later comments and latches are ignored.
+fn push_txn_span(statement: &str) -> Option<TraceCtx> {
+    let fresh = resolve_fresh(statement);
+    let active = if fresh.is_some() || roll_sample() {
+        let tracer = tracer();
+        let parent_cx = match &fresh {
+            // join the propagated trace: caller's span as (remote) parent
+            Some(ctx) => Context::current().with_remote_span_context(remote_ctx(ctx)),
+            None => Context::current(),
+        };
+        let builder = tracer
+            .span_builder("transaction")
+            .with_kind(SpanKind::Internal)
+            .with_attributes(transaction_attributes())
+            // backdated: the transaction began before its first statement ran
+            .with_start_time(
+                PENDING
+                    .with(|p| p.borrow().started_at)
+                    .unwrap_or_else(SystemTime::now),
+            );
+        let span = tracer.build_with_context(builder, &parent_cx);
+        let sc = span.span_context().clone();
+        Active {
+            span: Some(span),
+            sc: Some(sc),
+            origin: Origin::Transaction,
+        }
+    } else {
+        // Sampling dropped the transaction: no span, no context — its
+        // statements are not recorded either.
+        Active {
+            span: None,
+            sc: None,
+            origin: Origin::Transaction,
+        }
+    };
+    QUERY_STACK.with(|s| s.borrow_mut().push(active));
+    fresh
+}
+
+/// Begin tracking a statement: ensure the enclosing explicit transaction
+/// block has its transaction span (the block's first captured statement
+/// creates it), resolve the statement's parent context, start the SDK span,
 /// push the stack.
 ///
 /// `origin` identifies the statement, so that the matching end hook pops
@@ -258,35 +386,52 @@ fn statement_attributes(statement: &str) -> impl Iterator<Item = KeyValue> {
 fn push_span(statement: &str, tag: &'static str, origin: Origin) {
     let depth = QUERY_STACK.with(|s| s.borrow().len());
 
+    let top_level = depth == 0 && !is_parallel_worker();
+    let in_block = top_level && unsafe { pg_sys::IsTransactionBlock() };
+
     // Fresh trace context only for top-level statements of the leader
-    // process: comment, then the value latched by the `traceparent`
+    // process: inside an explicit transaction block the transaction span
+    // resolves it (exactly once, at its creation — the remaining statements
+    // inherit the transaction span); an autocommit statement resolves its
+    // own. Comment first, then the value latched by the `traceparent`
     // procedure. Nested statements (triggers, SPI) and parallel workers
-    // always parent to the enclosing span / the leader and never resolve.
-    let fresh = if depth == 0 && !is_parallel_worker() {
+    // never resolve.
+    let resolved = if in_block {
+        push_txn_span(statement)
+    } else if top_level {
         resolve_fresh(statement)
     } else {
         None
     };
     #[cfg(any(test, feature = "pg_test"))]
-    LAST_RESOLVED.with(|c| *c.borrow_mut() = fresh);
+    LAST_RESOLVED.with(|c| *c.borrow_mut() = resolved);
 
-    let sampled = fresh.is_some() || depth > 0 || roll_sample();
+    // Inside a block the propagated context belongs to the transaction span
+    // (it was adopted at the span's creation); the statement itself parents
+    // to the transaction span, never to the remote context.
+    let fresh = if in_block { None } else { resolved };
+
+    // A transaction span whose sampling roll dropped it left nothing to
+    // inherit: none of the transaction's statements are recorded either.
+    let txn_dropped = QUERY_STACK.with(|s| {
+        s.borrow()
+            .first()
+            .is_some_and(|a| a.origin == Origin::Transaction && a.sc.is_none())
+    });
+
+    let depth = QUERY_STACK.with(|s| s.borrow().len());
+    let sampled = !txn_dropped && (fresh.is_some() || depth > 0 || roll_sample());
     let active = if sampled {
         let tracer = tracer();
         let parent_cx = match fresh {
             Some(ctx) => {
                 // join the propagated trace: caller's span as (remote) parent
-                let sc = SpanContext::new(
-                    TraceId::from_hex(&hex_encode(&ctx.trace_id)).unwrap_or(TraceId::INVALID),
-                    SpanId::from_hex(&hex_encode(&ctx.parent_span_id)).unwrap_or(SpanId::INVALID),
-                    TraceFlags::new(ctx.flags),
-                    true,
-                    TraceState::NONE,
-                );
-                Context::current().with_remote_span_context(sc)
+                Context::current().with_remote_span_context(remote_ctx(&ctx))
             }
             None => match active_span_context() {
-                // enclosing statement's span as parent
+                // innermost enclosing entry's span as parent: the enclosing
+                // statement, or the transaction span when this is the
+                // block's first statement
                 Some(parent) => Context::current().with_remote_span_context(parent),
                 None => Context::current(),
             },
@@ -341,6 +486,26 @@ fn pop_span_for(origin: Origin, rows: Option<u64>) {
     if matches {
         pop_span(rows);
     }
+}
+
+/// End the transaction span at the stack bottom, if one is in flight.
+///
+/// Only reached from the pre-commit/prepare path, where every statement has
+/// completed normally; an aborted transaction unwinds through
+/// [`unwind_stack_to`], which ends its transaction span with an error status.
+fn end_txn_span() {
+    QUERY_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        if !stack
+            .first()
+            .is_some_and(|a| a.origin == Origin::Transaction)
+        {
+            return;
+        }
+        if let Some(mut span) = stack.remove(0).span {
+            span.end_with_timestamp(SystemTime::now());
+        }
+    });
 }
 
 // ---- Executor hooks --------------------------------------------------------
@@ -453,8 +618,8 @@ unsafe fn call_prev_process_utility(
     }
 }
 
-/// True when the utility statement is transaction control (`BEGIN`,
-/// `COMMIT`, `SAVEPOINT`, ...).
+/// True when the transaction-control statement is transaction control
+/// (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...).
 ///
 /// Decided from the parse node, not the string: in a multi-statement message
 /// every hook call receives the full text, so a leading-keyword check would
@@ -466,6 +631,81 @@ unsafe fn is_tx_control_utility(pstmt: *mut pg_sys::PlannedStmt) -> bool {
 /// True when the parse node is a transaction-control statement.
 pub fn is_tx_control_node(utility: *mut pg_sys::Node) -> bool {
     !utility.is_null() && unsafe { (*utility).type_ } == pg_sys::NodeTag::T_TransactionStmt
+}
+
+/// True when the parse node opens an explicit transaction block (`BEGIN`,
+/// `START TRANSACTION`).
+pub fn is_begin_txn_node(utility: *mut pg_sys::Node) -> bool {
+    if !is_tx_control_node(utility) {
+        return false;
+    }
+    // SAFETY: parse nodes are palloc'd, hence MAXALIGN'd (8), so casting the
+    // 4-byte-aligned `Node` header to the node's real (wider-aligned) type
+    // never misaligns.
+    #[expect(clippy::cast_ptr_alignment)]
+    let kind = unsafe { (*(utility.cast::<pg_sys::TransactionStmt>())).kind };
+    matches!(
+        kind,
+        pg_sys::TransactionStmtKind::TRANS_STMT_BEGIN
+            | pg_sys::TransactionStmtKind::TRANS_STMT_START
+    )
+}
+
+/// Record when the current transaction began: the transaction span (created
+/// lazily by the block's first captured statement) is backdated to this.
+fn record_txn_start() {
+    PENDING.with(|p| p.borrow_mut().started_at = Some(SystemTime::now()));
+}
+
+/// True when the utility statement is a `CALL` of the extension's own
+/// `traceparent` procedure.
+///
+/// Such a call is instrumentation plumbing: it must not emit a span of its
+/// own, and it must not create the transaction span *before* the value it
+/// latches exists — the first real statement of the transaction adopts the
+/// latch into the transaction span. Identified by the procedure's OID
+/// (resolved through `to_regprocedure` per `search_path`), so a same-named
+/// procedure elsewhere is never mistaken for it.
+pub unsafe fn is_traceparent_call(pstmt: *mut pg_sys::PlannedStmt) -> bool {
+    let utility = unsafe { (*pstmt).utilityStmt };
+    if utility.is_null() || unsafe { (*utility).type_ } != pg_sys::NodeTag::T_CallStmt {
+        return false;
+    }
+    let funcexpr = unsafe {
+        // SAFETY: parse nodes are palloc'd, hence MAXALIGN'd (8), so casting
+        // the 4-byte-aligned `Node` header to the node's real (wider-aligned)
+        // type never misaligns.
+        #[expect(clippy::cast_ptr_alignment)]
+        let call = utility.cast::<pg_sys::CallStmt>();
+        (*call).funcexpr
+    };
+    if funcexpr.is_null() {
+        return false;
+    }
+    let funcid = unsafe { (*funcexpr).funcid };
+    funcid != pg_sys::InvalidOid && funcid == traceparent_proc_oid()
+}
+
+/// OID of the extension's `traceparent(text)` procedure.
+///
+/// Resolved through `to_regprocedure` on first use and cached for the
+/// backend's lifetime. A miss (the library can be preloaded into databases
+/// where the extension's SQL was never installed) is not cached: the lookup
+/// retries until the procedure exists.
+fn traceparent_proc_oid() -> pg_sys::Oid {
+    static OID: OnceLock<pg_sys::Oid> = OnceLock::new();
+    if let Some(oid) = OID.get() {
+        return *oid;
+    }
+    match unsafe {
+        pgrx::direct_function_call::<pg_sys::Oid>(
+            pg_sys::to_regprocedure,
+            &["traceparent(text)".into_datum()],
+        )
+    } {
+        Some(oid) if oid != pg_sys::InvalidOid => *OID.get_or_init(|| oid),
+        _ => pg_sys::InvalidOid,
+    }
 }
 
 #[pg_guard]
@@ -480,13 +720,33 @@ unsafe extern "C-unwind" fn process_utility_hook(
     dest: *mut pg_sys::DestReceiver,
     qc: *mut pg_sys::QueryCompletion,
 ) {
+    // A `BEGIN`/`START TRANSACTION` opens an explicit block: record when, so
+    // the transaction span can be backdated to it.
+    if is_begin_txn_node(unsafe { (*pstmt).utilityStmt }) {
+        record_txn_start();
+    }
+
+    // The `traceparent` procedure's own call emits no span, at any depth.
+    if unsafe { is_traceparent_call(pstmt) } {
+        call_prev_process_utility(
+            pstmt,
+            query_string,
+            read_only_tree,
+            context,
+            params,
+            query_env,
+            dest,
+            qc,
+        );
+        return;
+    }
+
     // Only top-level utility statements; nested ones are covered via the
     // executor or are internal bookkeeping.
-    let depth = QUERY_STACK.with(|s| s.borrow().len());
-    let capture = depth == 0
+    let capture = stmt_depth() == 0
         && trace_enabled_here()
         && !query_string.is_null()
-        && !unsafe { is_tx_control_utility(pstmt) };
+        && !is_tx_control_utility(pstmt);
     if capture {
         let statement = CStr::from_ptr(query_string).to_string_lossy().into_owned();
         push_span(&statement, "utility", Origin::Utility);
@@ -563,9 +823,17 @@ unsafe extern "C-unwind" fn subxact_callback(
     }
 }
 
-/// Transaction callback: unwinds the query stack when the transaction aborts,
-/// and drops the latched traceparent when the transaction ends — the latch
-/// must never outlive its transaction, so pool handbacks are always clean.
+/// Transaction callback: manages the transaction span and the pending
+/// per-transaction state.
+///
+/// - abort: unwind every statement span of the transaction (its transaction
+///   span, when one exists, is ended last with an error status).
+/// - pre-commit / prepare: end the transaction span and drop the pending
+///   state — the latched traceparent must never outlive its transaction, so
+///   pool handbacks are always clean.
+///
+/// (The transaction's start time is recorded on the `BEGIN` statement, in
+/// the `ProcessUtility` hook — Postgres fires no event at transaction start.)
 unsafe extern "C-unwind" fn xact_callback(
     event: pg_sys::XactEvent::Type,
     _arg: *mut std::ffi::c_void,
@@ -575,19 +843,21 @@ unsafe extern "C-unwind" fn xact_callback(
     match event {
         XactEvent::XACT_EVENT_ABORT | XactEvent::XACT_EVENT_PARALLEL_ABORT => {
             // The whole transaction is gone; every statement in it must be
-            // unwound, including the ones that failed.
+            // unwound, including the ones that failed. The transaction span
+            // (bottom entry) ends last, with an error status.
             SUBXACT_BASES.with(|b| b.borrow_mut().clear());
             unwind_stack_to(0);
-            LATCHED.with(|l| l.borrow_mut().take());
+            clear_pending();
         }
         XactEvent::XACT_EVENT_PRE_COMMIT | XactEvent::XACT_EVENT_PREPARE => {
             // The transaction is about to end or be prepared (a prepared
-            // transaction also ends the session's involvement): drop the
-            // latched traceparent.
+            // transaction also ends the session's involvement): end its
+            // span, drop the pending state.
             SUBXACT_BASES.with(|b| {
                 b.borrow_mut().clear();
             });
-            LATCHED.with(|l| l.borrow_mut().take());
+            end_txn_span();
+            clear_pending();
         }
         _ => {
             // On commit the statements all completed and popped their spans.
@@ -595,6 +865,16 @@ unsafe extern "C-unwind" fn xact_callback(
             SUBXACT_BASES.with(|b| b.borrow_mut().clear());
         }
     }
+}
+
+/// Reset the pending per-transaction state.
+fn clear_pending() {
+    PENDING.with(|p| {
+        *p.borrow_mut() = PendingTxn {
+            started_at: None,
+            latch: None,
+        }
+    });
 }
 
 // ---- traceparent procedure ingestion ---------------------------------------
@@ -615,8 +895,11 @@ extension_sql!(
 /// at call time). Outside an explicit transaction the call emits a `WARNING`
 /// and is ignored: instrumentation must never break the workload, and a
 /// latched value must never spill into other transactions. Inside a
-/// transaction the value latches until transaction end (a later call
-/// overwrites; last call wins).
+/// transaction the value latches until the transaction span is created by
+/// the transaction's first captured statement (a later call overwrites; last
+/// call wins); a call arriving after that has no effect and warns —
+/// statements resolve no fresh context of their own anymore, so the value
+/// would go nowhere.
 pub fn ingest_traceparent(tp: &str, in_tx: bool) {
     let ctx = parse_traceparent(tp).unwrap_or_else(|| {
         ereport!(
@@ -634,7 +917,15 @@ pub fn ingest_traceparent(tp: &str, in_tx: bool) {
         );
         return;
     }
-    LATCHED.with(|l| *l.borrow_mut() = Some(ctx));
+    if txn_span_active() {
+        ereport!(
+            PgLogLevel::WARNING,
+            PgSqlErrorCode::ERRCODE_WARNING,
+            "call is ignored: the transaction span already started; call traceparent before any other statement of the transaction"
+        );
+        return;
+    }
+    PENDING.with(|p| p.borrow_mut().latch = Some(ctx));
 }
 
 /// C entry of the `traceparent` procedure. pgrx has no procedure attribute,
@@ -664,7 +955,7 @@ pub const extern "C" fn pg_finfo_set_traceparent() -> &'static pg_sys::Pg_finfo_
 /// warning); the latch is kept for the remaining statements of its
 /// transaction.
 fn resolve_fresh(statement: &str) -> Option<TraceCtx> {
-    let latched = LATCHED.with(|l| *l.borrow());
+    let latched = PENDING.with(|p| p.borrow().latch);
     if let Some(ctx) = traceparent_from_statement(statement) {
         if latched.is_some() {
             ereport!(
@@ -703,6 +994,60 @@ pub fn last_resolved_ctx() -> Option<TraceCtx> {
 #[cfg(any(test, feature = "pg_test"))]
 pub fn run_xact_callback(event: pg_sys::XactEvent::Type) {
     unsafe { xact_callback(event, std::ptr::null_mut()) };
+}
+
+/// Test hook: simulate a transaction span in flight, as [`push_txn_span`]
+/// pushes it — here the sampling-dropped variant, which carries no span and
+/// no context. Real entries are created inside the executor hooks,
+/// unreachable from a pgrx test.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn push_dropped_txn_entry() {
+    QUERY_STACK.with(|s| {
+        s.borrow_mut().push(Active {
+            span: None,
+            sc: None,
+            origin: Origin::Transaction,
+        });
+    });
+}
+
+/// Test hook: remove the transaction span entry at the stack bottom — real
+/// (pushed by `push_txn_span`) or synthetic. pg_tests run inside the
+/// framework's own explicit transaction, whose span is in flight by the time
+/// a test body runs; tests that exercise latch mechanics remove it first, so
+/// `CALL traceparent` behaves as it would as the first statement of a block.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn pop_txn_entry() {
+    QUERY_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        if stack
+            .first()
+            .is_some_and(|a| a.origin == Origin::Transaction)
+        {
+            stack.remove(0);
+        }
+    });
+}
+
+/// Test hook: record a transaction start, as the `BEGIN` handling of the
+/// `ProcessUtility` hook would. Real hook invocations for top-level
+/// statements are unreachable from a pgrx test (tests run nested inside the
+/// executor).
+#[cfg(any(test, feature = "pg_test"))]
+pub fn record_txn_start_for_test() {
+    record_txn_start();
+}
+
+/// Test hook: the pending transaction state's recorded start time.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn pending_started_at() -> Option<SystemTime> {
+    PENDING.with(|p| p.borrow().started_at)
+}
+
+/// Test hook: the OID resolved for the `traceparent(text)` procedure.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn traceparent_proc_oid_for_test() -> pg_sys::Oid {
+    traceparent_proc_oid()
 }
 
 // ---- init ------------------------------------------------------------------

@@ -4,9 +4,10 @@ A PostgreSQL extension (built with [pgrx]) that emits OpenTelemetry **logs, trac
 metrics**, configurable directly in `postgresql.conf`.
 
 - **Traces** — every executed statement becomes a span (executor hooks +
-  `ProcessUtility` hook). Statements run from inside other statements
-  (functions, SPI, CTEs with subqueries) become child spans of the outer
-  statement.
+  `ProcessUtility` hook), nested under the wrapping `transaction` span of an
+  explicit transaction block (`BEGIN` … `COMMIT`). Statements run from inside
+  other statements (functions, SPI, CTEs with subqueries) become child spans
+  of the outer statement.
 - **Trace-context propagation** — apps can attach a query to a distributed
   trace by passing a W3C `traceparent` through either of two sources:
   a sqlcommenter-style SQL comment, or a `traceparent` procedure call inside
@@ -105,7 +106,7 @@ These are equivalent to the standard OpenTelemetry environment variables, minus 
 
 | GUC | Default | Meaning |
 | --- | --- | --- |
-| `pg_otel_exporter.traces` | `on` | Report each executed statement as a span. |
+| `pg_otel_exporter.traces` | `on` | Report each executed statement as a span, wrapped in a `transaction` span per explicit transaction block. |
 | `pg_otel_exporter.metrics` | `on` | Enable the metrics background worker. |
 | `pg_otel_exporter.logs` | `on` | Export server log messages. |
 
@@ -115,17 +116,25 @@ These are equivalent to the standard OpenTelemetry environment variables, minus 
 
 | Attribute | Value |
 | --- | --- |
-| span name | `query` (executor statements) or `utility` (`ProcessUtility` statements) |
+| span name | `transaction` (explicit transaction blocks), `query` (executor statements) or `utility` (`ProcessUtility` statements) |
 | `db.system` | `postgresql` |
 | `db.name` | database executing the statement |
 | `db.user` | user executing the statement |
-| `db.statement` | full statement text |
+| `db.statement` | full statement text (`transaction` spans omit it) |
 | `db.application_name` | `application_name` of the session |
 | `db.rows_affected` | rows processed |
 
+Explicit transaction blocks get a `transaction` span wrapping their
+statements: it starts when the block's first captured statement runs (its
+start time is backdated to the `BEGIN`), ends at pre-commit (or `PREPARE
+TRANSACTION`), and is marked as errored when the transaction aborts. Every
+statement of the block, and every log record the transaction raises, nests
+under it.
+
 Utility statements (DDL, `COPY`, `DO`, ...) are captured via the
 `ProcessUtility` hook. Transaction-control statements (`BEGIN`, `COMMIT`,
-`SAVEPOINT`, ...) create no spans. Errors mark the span's status.
+`SAVEPOINT`, ...) and `CALL traceparent(...)` create no spans. Errors mark
+the span's status.
 
 ### Metrics
 
@@ -149,13 +158,25 @@ A query can join the caller's distributed trace: its span shares the caller's
 trace id and parents to the caller's span id, so it shows up nested under the
 application's request in Jaeger, OpenObserve, etc.
 
+Inside an explicit transaction block, the propagated context is adopted once
+by the transaction span — from the block's *first* statement — and every
+statement of the block nests under it, so the whole transaction joins the
+caller's trace as one subtree. Later statements of the same block ignore
+their own propagated context (trace-context providers should send it on the
+first statement, or use the procedure below). Outside of explicit blocks
+(autocommit), each statement adopts its own context.
+
 Two sources mentioned below can attach a W3C `traceparent` to statements.
 When both are provided for the same statement, the comment wins and a warning is logged.
 
 ### Procedure
 
-A procedure call inside a transaction: `CALL traceparent('00-<trace-id>-<parent-span-id>-<flags>')`.
-Calling it outside of a transaction is a no-op and simply logs a warning.
+A procedure call as the first statement of a transaction:
+`CALL traceparent('00-<trace-id>-<parent-span-id>-<flags>')`.
+The transaction span adopts the value when it is created by the transaction's
+first statement; a later call warns and is ignored (statements no longer
+resolve context of their own, so the value would go nowhere). Calling it
+outside of a transaction is a no-op and simply logs a warning.
 
 ```sql
 BEGIN;
@@ -164,9 +185,9 @@ SELECT * FROM users;
 COMMIT;
 ```
 
-The provided ID is applied to all statements inside the transaction after the call, and
-the value is cleared at the end of it (commit, abort, or
-`PREPARE TRANSACTION`). Providing an invalid `traceparent` is a no-op and an error will be logged.
+The value is cleared at the end of the transaction (commit, abort, or
+`PREPARE TRANSACTION`). Providing an invalid `traceparent` is a no-op and an
+error will be logged.
 
 ### Comment
 

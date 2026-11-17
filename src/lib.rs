@@ -2,10 +2,13 @@
 //! PostgreSQL.
 //!
 //! - **Traces**: every executed statement becomes a span (executor +
-//!   `ProcessUtility` hooks). Parent context can be attached via a W3C
-//!   `traceparent`, provided through either of two equal channels: a
-//!   sqlcommenter-style SQL comment, or
-//!   `CALL traceparent(...)` inside an explicit transaction.
+//!   `ProcessUtility` hooks), nested under the wrapping `transaction` span of
+//!   an explicit transaction block (`BEGIN` … `COMMIT`). Parent context can
+//!   be attached via a W3C `traceparent`, provided through either of two
+//!   equal channels: a sqlcommenter-style SQL comment, or
+//!   `CALL traceparent(...)` inside an explicit transaction — the
+//!   transaction span adopts it, and everything the transaction does joins
+//!   the caller's trace under it.
 //! - **Metrics**: a background worker samples `pg_stat`_* views on an interval,
 //!   mirroring otelcol-contrib's Postgres receiver metric set.
 //!   Requires `shared_preload_libraries = 'pg_otel_exporter'`.
@@ -119,9 +122,9 @@ mod tests {
         );
     }
 
-    /// `CALL traceparent` inside a transaction latches the value: statements
-    /// *after* the call resolve it as fresh parent context, statements before
-    /// it don't (the context applies only from the call onward).
+    /// `CALL traceparent` inside a transaction latches the value: the
+    /// transaction span adopts it when it is created by the transaction's
+    /// first captured statement; the *last* call before that wins.
     #[pg_test]
     fn test_traceparent_call_latches_for_subsequent_statements() {
         assert!(
@@ -129,6 +132,10 @@ mod tests {
             "nothing latched yet"
         );
 
+        // pg_tests run inside the framework's explicit transaction, whose
+        // span is already in flight; remove it, so the CALL latches the way
+        // it would as the first statement of a block.
+        crate::traces::pop_txn_entry();
         Spi::run(&format!("CALL traceparent('{TP_A}')")).expect("CALL traceparent failed");
 
         let ctx = resolve_fresh_ctx("SELECT 1").expect("latched traceparent not resolved");
@@ -148,6 +155,7 @@ mod tests {
     /// A later `CALL` overwrites the latch (last call wins).
     #[pg_test]
     fn test_traceparent_call_overwrites_previous_latch() {
+        crate::traces::pop_txn_entry();
         Spi::run(&format!("CALL traceparent('{TP_A}')")).expect("CALL traceparent failed");
         Spi::run(&format!("CALL traceparent('{TP_B}')")).expect("CALL traceparent failed");
 
@@ -166,6 +174,7 @@ mod tests {
     /// with the real event, as Postgres would.
     #[pg_test]
     fn test_traceparent_latch_cleared_at_commit() {
+        crate::traces::pop_txn_entry();
         Spi::run(&format!("CALL traceparent('{TP_A}')")).expect("CALL traceparent failed");
         assert!(resolve_fresh_ctx("SELECT 1").is_some());
 
@@ -179,6 +188,7 @@ mod tests {
     /// The latch is dropped when the transaction aborts (`XACT_EVENT_ABORT`).
     #[pg_test]
     fn test_traceparent_latch_cleared_at_abort() {
+        crate::traces::pop_txn_entry();
         Spi::run(&format!("CALL traceparent('{TP_A}')")).expect("CALL traceparent failed");
         assert!(resolve_fresh_ctx("SELECT 1").is_some());
 
@@ -194,6 +204,7 @@ mod tests {
     /// latch must survive — the request continues and stays in its trace.
     #[pg_test]
     fn test_traceparent_latch_survives_handled_subxact_exception() {
+        crate::traces::pop_txn_entry();
         Spi::run("CREATE TEMP TABLE otel_tp_latch_test(i int)")
             .expect("failed to create temp table");
         Spi::run("INSERT INTO otel_tp_latch_test VALUES (0)").expect("failed to insert test row");
@@ -238,11 +249,11 @@ mod tests {
         Spi::run("CALL traceparent('not-a-traceparent')").expect("invalid traceparent must error");
     }
 
-    /// When both channels provide a traceparent for the same statement, the
-    /// comment wins — and the latch is kept for the remaining statements of
-    /// the transaction.
+    /// When both channels provide a traceparent, the comment wins — and the
+    /// latch is kept for the transaction span's adoption.
     #[pg_test]
     fn test_comment_wins_over_latched_traceparent() {
+        crate::traces::pop_txn_entry();
         Spi::run(&format!("CALL traceparent('{TP_A}')")).expect("CALL traceparent failed");
 
         let stmt = format!("SELECT 1 /* traceparent='{TP_B}' */");
@@ -264,6 +275,7 @@ mod tests {
     /// enclosing statement's span.
     #[pg_test]
     fn test_nested_statements_do_not_resolve_latch() {
+        crate::traces::pop_txn_entry();
         Spi::run(&format!("CALL traceparent('{TP_A}')")).expect("CALL traceparent failed");
         Spi::run("CREATE TEMP TABLE otel_tp_nested(i int)").expect("failed to create temp table");
         Spi::run(
@@ -300,6 +312,152 @@ mod tests {
         assert!(is_tx_control_node(&raw mut tx));
         assert!(!is_tx_control_node(&raw mut drop));
         assert!(!is_tx_control_node(std::ptr::null_mut()));
+    }
+
+    /// `CALL` statements of the extension's own `traceparent` procedure are
+    /// recognized from the parse node + function OID, so they can be skipped
+    /// as instrumentation plumbing (no span of their own, no premature
+    /// transaction span).
+    #[pg_test]
+    fn test_traceparent_call_node_detection() {
+        use crate::traces::is_traceparent_call;
+
+        let oid = crate::traces::traceparent_proc_oid_for_test();
+
+        unsafe {
+            // the extension's own traceparent procedure is ours; the same
+            // call shape targeting another function is not
+            for funcid in [pg_sys::Oid::from(42_u32), oid] {
+                let mut funcexpr = pg_sys::FuncExpr {
+                    funcid,
+                    ..Default::default()
+                };
+                let mut call = pg_sys::CallStmt {
+                    type_: pg_sys::NodeTag::T_CallStmt,
+                    funcexpr: &raw mut funcexpr,
+                    ..Default::default()
+                };
+                let mut pstmt = pg_sys::PlannedStmt {
+                    utilityStmt: (&raw mut call).cast::<pg_sys::Node>(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    is_traceparent_call(&raw mut pstmt),
+                    funcid == oid,
+                    "unexpected detection for funcid {funcid:?}"
+                );
+            }
+
+            // a non-call utility statement is not ours
+            let mut drop = pg_sys::DropStmt {
+                type_: pg_sys::NodeTag::T_DropStmt,
+                ..Default::default()
+            };
+            let mut pstmt = pg_sys::PlannedStmt {
+                utilityStmt: (&raw mut drop).cast::<pg_sys::Node>(),
+                ..Default::default()
+            };
+            assert!(!is_traceparent_call(&raw mut pstmt));
+
+            // restoring the call node of our own procedure is detected again
+            let mut funcexpr = pg_sys::FuncExpr {
+                funcid: oid,
+                ..Default::default()
+            };
+            let mut call = pg_sys::CallStmt {
+                type_: pg_sys::NodeTag::T_CallStmt,
+                funcexpr: &raw mut funcexpr,
+                ..Default::default()
+            };
+            let mut pstmt = pg_sys::PlannedStmt {
+                utilityStmt: (&raw mut call).cast::<pg_sys::Node>(),
+                ..Default::default()
+            };
+            assert!(is_traceparent_call(&raw mut pstmt));
+        }
+    }
+
+    /// The `traceparent(text)` procedure's OID resolves to a real procedure.
+    #[pg_test]
+    fn test_traceparent_proc_oid_resolves() {
+        assert_ne!(
+            crate::traces::traceparent_proc_oid_for_test(),
+            pg_sys::InvalidOid
+        );
+    }
+
+    /// Only `BEGIN`/`START TRANSACTION` count as opening an explicit block;
+    /// the other transaction-control statements don't.
+    #[pg_test]
+    fn test_begin_txn_node_detection() {
+        use {crate::traces::is_begin_txn_node, pg_sys::TransactionStmtKind as Kind};
+
+        let cases = [
+            (Kind::TRANS_STMT_BEGIN, true),
+            (Kind::TRANS_STMT_START, true),
+            (Kind::TRANS_STMT_COMMIT, false),
+            (Kind::TRANS_STMT_SAVEPOINT, false),
+        ];
+        for (kind, opens_block) in cases {
+            let mut stmt = pg_sys::TransactionStmt {
+                type_: pg_sys::NodeTag::T_TransactionStmt,
+                kind,
+                ..Default::default()
+            };
+            assert_eq!(
+                is_begin_txn_node((&raw mut stmt).cast::<pg_sys::Node>()),
+                opens_block,
+                "unexpected detection for kind {kind:?}"
+            );
+        }
+        assert!(!is_begin_txn_node(std::ptr::null_mut()));
+    }
+
+    /// A `BEGIN` records the transaction's start time (the transaction span
+    /// is backdated to it); the commit boundary clears it.
+    ///
+    /// The recording runs in the `ProcessUtility` hook, unreachable from a
+    /// pgrx test (tests run nested inside the executor), so the entry logic
+    /// is invoked directly — exactly what a real `BEGIN` does.
+    #[pg_test]
+    fn test_begin_records_pending_start_time_until_commit() {
+        // The framework's own `BEGIN` already recorded a start time (tests
+        // run inside an explicit transaction); a fresh BEGIN re-records it.
+        crate::traces::record_txn_start_for_test();
+        assert!(
+            crate::traces::pending_started_at().is_some(),
+            "a BEGIN must record the transaction's start time"
+        );
+        crate::traces::run_xact_callback(pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT);
+        assert_eq!(crate::traces::pending_started_at(), None);
+    }
+
+    /// On abort the transaction span entry is unwound with everything else,
+    /// back to an empty stack; pending state cleared.
+    #[pg_test]
+    fn test_xact_abort_unwinds_txn_entry() {
+        let before = query_stack_depth();
+        crate::traces::record_txn_start_for_test();
+        crate::traces::push_dropped_txn_entry();
+        assert_eq!(query_stack_depth(), before + 1);
+
+        crate::traces::run_xact_callback(pg_sys::XactEvent::XACT_EVENT_ABORT);
+        assert_eq!(query_stack_depth(), 0, "QUERY_STACK leaked an entry");
+        assert_eq!(crate::traces::pending_started_at(), None);
+    }
+
+    /// `CALL traceparent` after the transaction span has started is
+    /// discarded: statements resolve no fresh context of their own anymore,
+    /// so the value would go nowhere.
+    #[pg_test]
+    fn test_traceparent_call_after_txn_span_started_is_discarded() {
+        // pg_tests run inside the framework's explicit transaction, whose
+        // span is already in flight — exactly the state this rule guards.
+        crate::traces::ingest_traceparent(TP_A, true);
+        assert!(
+            resolve_fresh_ctx("SELECT 1").is_none(),
+            "a call after the transaction span started must be discarded"
+        );
     }
 }
 
